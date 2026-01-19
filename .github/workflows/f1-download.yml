@@ -1,0 +1,48 @@
+name: F1 FastF1 Downloader
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install fastf1 pandas
+
+      - name: Restore FastF1 cache
+        uses: actions/cache@v4
+        with:
+          path: .fastf1_cache
+          key: fastf1-cache-${{ runner.os }}
+
+      - name: Restore progress + output
+        uses: actions/cache@v4
+        with:
+          path: |
+            progress
+            output
+          key: f1-data-${{ github.run_id }}
+          restore-keys: |
+            f1-data-
+
+      - name: Run downloader
+        run: python rawr.py
+
+      - name: Upload data artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: f1-data
+          path: output
