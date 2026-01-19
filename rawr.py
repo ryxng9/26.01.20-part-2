@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
 """
-FastF1 bulk downloader/exporter (March 2025 only), rate-limit friendly
+FastF1 bulk downloader/exporter (2025 only), rate-limit friendly
 
-Output structure:
-  output/2025/<EventName>/<SessionName>/*.csv
+Output structure (matches your screenshot):
+  output/2025/<EventName>/<SessionName>/
+    - laps.csv
+    - car_data_driver_<num>.csv
+    - position_data_driver_<num>.csv
+    - weather_data.csv (if available)
+    - session_results.csv (if available)
+    - session_metadata.csv
 
 Resume support:
   progress/download_progress.txt
-  Lines: "2025|<EventName>|<SessionName>"
 
 Cache:
   .fastf1_cache (persist via GitHub Actions cache)
+
+Rate friendliness:
+  - configurable delay + jitter
+  - retry with exponential backoff for transient failures
+  - hard caps: max sessions per run + max runtime minutes
 """
 
 import os
@@ -18,28 +28,29 @@ import time
 import random
 import logging
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime
 
 import pandas as pd
 import fastf1
 
 
 # -------------------------
-# Configuration
+# Configuration (2025 only)
 # -------------------------
-YEAR = 2025
-MONTH_START = date(2025, 3, 1)
-MONTH_END = date(2025, 3, 31)
+YEAR = 2022
 
+# Keep your session list
 SESSIONS = ['FP1', 'FP2', 'FP3', 'Sprint Shootout', 'Sprint', 'Q', 'R']
 
+# Folder structure (matches your workflow: output + progress)
 OUTPUT_BASE_DIR = Path(os.getenv("F1_OUTPUT_DIR", "output"))
 PROGRESS_DIR = Path(os.getenv("F1_PROGRESS_DIR", "progress"))
 PROGRESS_FILE = PROGRESS_DIR / os.getenv("F1_PROGRESS_FILE", "download_progress.txt")
 
+# FastF1 cache dir (matches workflow cache path)
 CACHE_DIR = Path(os.getenv("F1_CACHE_DIR", ".fastf1_cache"))
 
-# Rate friendliness
+# Rate limit friendliness (tune via workflow env)
 DELAY_BETWEEN_SESSIONS = float(os.getenv("F1_DELAY_SECONDS", "2.5"))
 JITTER_SECONDS = float(os.getenv("F1_JITTER_SECONDS", "1.0"))
 
@@ -50,7 +61,9 @@ MAX_RETRIES = int(os.getenv("F1_MAX_RETRIES", "3"))
 BACKOFF_BASE_SECONDS = float(os.getenv("F1_BACKOFF_BASE_SECONDS", "3.0"))
 BACKOFF_MAX_SECONDS = float(os.getenv("F1_BACKOFF_MAX_SECONDS", "60.0"))
 
-# OFF by default (your screenshot doesn't show telemetry_fastest_*.csv and it's extra load)
+# IMPORTANT:
+# Your screenshot does NOT show telemetry_fastest_*.csv.
+# That export can add load. Default OFF; you can enable via env if you need it.
 EXPORT_DETAILED_TELEMETRY = os.getenv("F1_EXPORT_DETAILED_TELEMETRY", "0").lower() in ("1", "true", "yes")
 
 
@@ -107,6 +120,7 @@ def create_folder_structure(year: int, event_name: str, session_name: str) -> Pa
 def save_dataframe(df: pd.DataFrame, path: Path, filename: str) -> bool:
     try:
         if df is not None and not df.empty:
+            (path / filename).parent.mkdir(parents=True, exist_ok=True)
             df.to_csv(path / filename, index=True)
             logger.info(f"  Saved: {filename}")
             return True
@@ -136,9 +150,14 @@ def should_stop(start_ts: float, sessions_done: int) -> bool:
 
 
 def export_session_data(session: fastf1.core.Session, path: Path) -> bool:
+    """
+    Exports the same categories as your original script:
+    - results, laps, weather_data, car_data per driver, pos_data per driver, metadata
+    - optional detailed fastest-lap telemetry (off by default)
+    """
     exported_any = False
 
-    # 1) Results
+    # 1) Session Results
     try:
         if getattr(session, "results", None) is not None:
             exported_any |= save_dataframe(session.results, path, "session_results.csv")
@@ -161,7 +180,7 @@ def export_session_data(session: fastf1.core.Session, path: Path) -> bool:
     except Exception as e:
         logger.error(f"  Error exporting weather data: {e}")
 
-    # 4) Car data per driver
+    # 4) Car data (per driver)
     try:
         car_data = getattr(session, "car_data", None)
         if car_data:
@@ -171,7 +190,7 @@ def export_session_data(session: fastf1.core.Session, path: Path) -> bool:
     except Exception as e:
         logger.error(f"  Error exporting car data: {e}")
 
-    # 5) Position data per driver
+    # 5) Position data (per driver)
     try:
         pos_data = getattr(session, "pos_data", None)
         if pos_data:
@@ -181,7 +200,7 @@ def export_session_data(session: fastf1.core.Session, path: Path) -> bool:
     except Exception as e:
         logger.error(f"  Error exporting position data: {e}")
 
-    # 6) Metadata
+    # 6) Session metadata
     try:
         event = getattr(session, "event", None)
         sess_info = getattr(session, "session_info", {}) or {}
@@ -198,7 +217,7 @@ def export_session_data(session: fastf1.core.Session, path: Path) -> bool:
     except Exception as e:
         logger.error(f"  Error exporting session metadata: {e}")
 
-    # 7) Optional detailed telemetry per driver (fastest lap)
+    # 7) Optional: Detailed fastest-lap telemetry per driver (can be heavy)
     if EXPORT_DETAILED_TELEMETRY:
         try:
             laps = getattr(session, "laps", None)
@@ -214,8 +233,8 @@ def export_session_data(session: fastf1.core.Session, path: Path) -> bool:
                         tel = fastest_lap.get_telemetry()
                         if tel is not None and not tel.empty:
                             exported_any |= save_dataframe(tel, path, f"telemetry_fastest_{driver}.csv")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"  Could not get fastest telemetry for {driver}: {e}")
         except Exception as e:
             logger.error(f"  Error exporting detailed telemetry: {e}")
 
@@ -229,8 +248,9 @@ def load_session_with_retries(year: int, event_name: str, session_name: str) -> 
         try:
             session = fastf1.get_session(year, event_name, session_name)
 
-            # Efficient: we don't export messages, so don't load them.
-            # Keep telemetry=True because car_data/pos_data require it.
+            # Efficiency choices:
+            # - messages=False (you aren't exporting messages)
+            # - keep laps/telemetry/weather because you export laps + car_data/pos_data + weather_data
             session.load(laps=True, telemetry=True, weather=True, messages=False)
 
             return session
@@ -238,13 +258,14 @@ def load_session_with_retries(year: int, event_name: str, session_name: str) -> 
             last_err = e
             msg = str(e)
 
+            # If rate limit, bubble up so caller can stop cleanly
             if is_rate_limit_error(msg):
                 raise
 
             backoff = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)))
             backoff += random.random() * JITTER_SECONDS
-            logger.warning(f"  Load failed (attempt {attempt}/{MAX_RETRIES}) for {year} {event_name} {session_name}: {msg}")
 
+            logger.warning(f"  Load failed (attempt {attempt}/{MAX_RETRIES}) for {year} {event_name} {session_name}: {msg}")
             if attempt < MAX_RETRIES:
                 logger.info(f"  Backing off for {backoff:.1f}s...")
                 time.sleep(backoff)
@@ -253,25 +274,7 @@ def load_session_with_retries(year: int, event_name: str, session_name: str) -> 
     raise last_err
 
 
-def event_date_in_march_2025(event_row: pd.Series) -> bool:
-    """
-    FastF1 schedule includes EventDate; sometimes it's pandas Timestamp, sometimes datetime/date-like.
-    We normalize to date and check March 2025 inclusive.
-    """
-    ev = event_row.get("EventDate")
-    if ev is None or (isinstance(ev, float) and pd.isna(ev)):
-        return False
-
-    # pandas Timestamp / datetime -> date
-    try:
-        ev_date = pd.to_datetime(ev).date()
-    except Exception:
-        return False
-
-    return MONTH_START <= ev_date <= MONTH_END
-
-
-def download_march_2025() -> None:
+def download_2025() -> None:
     completed = load_progress()
     start_ts = time.time()
     sessions_done_this_run = 0
@@ -282,11 +285,10 @@ def download_march_2025() -> None:
     rate_limit_hit = False
 
     logger.info("\n" + "=" * 80)
-    logger.info("Processing Year: 2025 (March only test drive)")
-    logger.info("Filter: 2025-03-01 .. 2025-03-31")
+    logger.info(f"Processing Year: {YEAR}")
     logger.info("=" * 80)
 
-    # One schedule call
+    # One schedule call for the year
     try:
         schedule = fastf1.get_event_schedule(YEAR)
     except Exception as e:
@@ -296,11 +298,7 @@ def download_march_2025() -> None:
             return
         raise
 
-    # Filter to March events only
-    march_schedule = schedule[schedule.apply(event_date_in_march_2025, axis=1)]
-    logger.info(f"Found {len(march_schedule)} events in March 2025")
-
-    for _, event in march_schedule.iterrows():
+    for _, event in schedule.iterrows():
         if rate_limit_hit or should_stop(start_ts, sessions_done_this_run):
             break
 
@@ -343,17 +341,18 @@ def download_march_2025() -> None:
                 msg = str(e)
                 if is_rate_limit_error(msg):
                     logger.error("\n" + "!" * 80)
-                    logger.error("RATE LIMIT HIT! Stopping now. Next run will resume via progress file.")
+                    logger.error("RATE LIMIT HIT!")
+                    logger.error("Stopping now. Next run will resume via progress file.")
                     logger.error("!" * 80)
                     rate_limit_hit = True
                     break
 
-                # Sprint sessions may not exist for some events — continue safely
+                # Many events simply don't have Sprint sessions; treat as a normal error and continue.
                 logger.warning(f"✗ Could not process {session_id}: {msg}")
                 continue
 
     logger.info("\n" + "=" * 80)
-    logger.info("Download Summary (March 2025)")
+    logger.info("Download Summary")
     logger.info("=" * 80)
     logger.info(f"Sessions attempted this run: {total_attempted}")
     logger.info(f"Successful downloads: {successful}")
@@ -364,5 +363,5 @@ def download_march_2025() -> None:
 
 if __name__ == "__main__":
     logger.info(f"Starting download at {datetime.now().isoformat(timespec='seconds')}")
-    download_march_2025()
+    download_2025()
     logger.info(f"Finished at {datetime.now().isoformat(timespec='seconds')}")
